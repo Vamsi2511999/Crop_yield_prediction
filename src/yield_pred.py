@@ -4,16 +4,20 @@ import numpy as np
 import pandas as pd
 import tensorflow as tf
 from tensorflow.keras.preprocessing.image import ImageDataGenerator
-from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split, GridSearchCV, cross_val_score,RandomizedSearchCV
+from sklearn.ensemble import RandomForestRegressor,GradientBoostingRegressor
+from sklearn.feature_selection import RFE
 from sklearn.metrics import mean_squared_error, mean_absolute_percentage_error, explained_variance_score, mean_squared_log_error
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder
+from sklearn.pipeline import Pipeline
 import matplotlib.pyplot as plt
 from tensorflow.keras import layers, models
 
-
+# print("Num GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
 # Define paths to image dataset
-train_dir = '../dataset/Maize/train_set'
-validation_dir = '../dataset/Maize/test_set'
+train_dir = "<pest images training data directory>"
+validation_dir = "<pest images validation/test data directory>"
 
 # Image data generator for preprocessing
 train_datagen = ImageDataGenerator(rescale=1./255)
@@ -46,7 +50,7 @@ model = models.Sequential([
     layers.MaxPooling2D((2, 2)),
     layers.Flatten(),
     layers.Dense(512, activation='relu'),
-    layers.Dense(1, activation='softmax')
+    layers.Dense(7, activation='softmax')
 ])
 
 # Compile CNN model
@@ -61,7 +65,7 @@ history = model.fit(
     validation_steps=50
 )
 
-model.save('pest_prediction_model.h5')
+model.save('pest_prediction_model.keras')
 
 # Define function to predict pest infestation using CNN model
 def predict_pest_infestation(image_path):
@@ -76,20 +80,27 @@ class_labels = ['fall armyworm', 'grasshopper', 'healthy', 'leaf beetle', 'leaf 
 
 
 # Load dataset
-data = pd.read_csv('../dataset/crop_yield.csv')
+data = pd.read_csv('<Path for >')
 #Adding images path of the data as column
-image_folder = '../dataset/maize_leaf_images'
+image_folder = "<path for image data for the yield prediction>"
 image_files = os.listdir(image_folder)
-selected_images = random.sample(image_files, len(data))
+sample_size = min(len(image_files), len(data))
+selected_images = random.sample(image_files, sample_size)
+
+# If there are fewer images than rows, repeat some images to match the row count
+if len(data) > len(image_files):
+    # Repeat images until we reach the needed count
+    extra_images = random.choices(image_files, k=len(data) - len(image_files))
+    selected_images.extend(extra_images)
 image_paths = [os.path.join(image_folder, img) for img in selected_images]
 data['Image_Path'] = image_paths
 
 # Add pest infestation predictions to dataset
-data['pest_class_index'] = data['image_path'].apply(predict_pest_infestation)
+data['pest_class_index'] = data['Image_Path'].apply(predict_pest_infestation)
 data['Pest_Type'] = data['pest_class_index'].apply(lambda x: class_labels[x])
 
 severity_mapping = {
-    'Healthy': 0.0,
+    'healthy': 0.0,
     'fall armyworm': 0.2,
     'grasshopper': 0.3,
     'leaf beetle': 0.4,
@@ -102,35 +113,56 @@ data['Pest_Severity'] = data['Pest_Type'].map(severity_mapping)
 data['Adjusted_Yield'] = data['Yield'] * (1 - data['Pest_Severity'])
 
 # Prepare features and target variables
-X = data.drop(['Yield', 'pest_class_index', 'Pest_Type', 'Pest_Severity', 'Adjusted_Yield', 'image_path'], axis=1)
+X = data.drop(['State','Yield', 'pest_class_index', 'Adjusted_Yield', 'Image_Path'], axis=1)
 y_adjusted_yield = data['Adjusted_Yield']
+
 
 # Split data into training and testing sets
 X_train, X_test, y_train, y_test = train_test_split(X, y_adjusted_yield, test_size=0.2, random_state=42)
 
+# Identify categorical and numerical features for encoding
+categorical_features = ['Crop', 'Season', 'Pest_Type']
+numeric_features = ['Area', 'Crop_Year', 'Production', 'Annual_Rainfall', 'Fertilizer', 'Pesticide', 'Pest_Severity']
+
+# Preprocessing pipeline
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', 'passthrough', numeric_features),
+        ('cat', OneHotEncoder(handle_unknown='ignore'), categorical_features)
+    ]
+)
+
+# Create the model pipeline with preprocessing and regressor
+pipeline = Pipeline(steps=[
+    ('preprocessor', preprocessor),
+    ('regressor', RandomForestRegressor(random_state=42))
+])
+
 # Define parameter grid for RandomForestRegressor
 param_grid = {
-    'n_estimators': [50, 100, 200],
-    'max_depth': [None, 10, 20, 30],
-    'min_samples_split': [2, 5, 10],
-    'min_samples_leaf': [1, 2, 4]
+    'regressor__n_estimators': [50, 100, 200],
+    'regressor__max_depth': [None, 10, 20, 30],
+    'regressor__min_samples_split': [2, 5, 10],
+    'regressor__min_samples_leaf': [1, 2, 4]
 }
 
 # Perform grid search for best parameters
-grid_search = GridSearchCV(estimator=RandomForestRegressor(random_state=42), param_grid=param_grid, cv=5, n_jobs=-1, scoring='neg_mean_squared_error')
+grid_search = RandomizedSearchCV(estimator=pipeline, param_distributions=param_grid, cv=10, n_jobs=-1, scoring='neg_mean_squared_error')
 grid_search.fit(X_train, y_train)
 best_params = grid_search.best_params_
 best_score = grid_search.best_score_
 
-# Train RandomForestRegressor with best parameters
-best_yield_model = RandomForestRegressor(**best_params, random_state=42)
-best_yield_model.fit(X_train, y_train)
+# # Train RandomForestRegressor with best parameters
+# best_yield_model = RandomForestRegressor(**best_params, random_state=42)
+# best_yield_model.fit(X_train, y_train)
+best_yield_model = grid_search.best_estimator_
 
 # Cross-validation for yield model
-yield_cv_scores = cross_val_score(best_yield_model, X_train, y_train, cv=5, scoring='neg_mean_squared_error')
+yield_cv_scores = cross_val_score(best_yield_model, X_train, y_train, cv=10, scoring='neg_mean_squared_error')
 
 # Make predictions
 best_yield_predictions = best_yield_model.predict(X_test)
+yield_feature_importances = best_yield_model.named_steps['regressor'].feature_importances_
 
 # Evaluate models
 best_yield_mse = mean_squared_error(y_test, best_yield_predictions)
@@ -147,7 +179,7 @@ print(f'Root Mean Squared Error (RMSE): {rmse}')
 
 # Additional metrics for evaluation
 yield_r2 = best_yield_model.score(X_test, y_test)
-yield_feature_importances = best_yield_model.feature_importances_
+yield_feature_importances = yield_feature_importances
 yield_mape = mean_absolute_percentage_error(y_test, best_yield_predictions)
 yield_explained_variance = explained_variance_score(y_test, best_yield_predictions)
 yield_msle = mean_squared_log_error(y_test, best_yield_predictions)
@@ -161,9 +193,30 @@ print(f'Yield Model MAPE: {yield_mape}')
 print(f'Yield Model Explained Variance: {yield_explained_variance}')
 print(f'Yield Model MSLE: {yield_msle}')
 
+rf_model = best_yield_model.named_steps['regressor']
+
+# Get feature names after preprocessing
+# Get the transformed feature names from the OneHotEncoder step
+encoder = best_yield_model.named_steps['preprocessor'].transformers_[1][1]  # Get OneHotEncoder instance
+
+# Fit the encoder on the categorical data (use only the categorical features from X)
+encoder.fit(X[categorical_features])
+
+# Get the transformed feature names (for the categorical variables)
+encoded_feature_names = encoder.get_feature_names_out(categorical_features)
+
+# Combine the numeric feature names with the encoded categorical feature names
+final_feature_names = list(numeric_features) + list(encoded_feature_names)
+
+# Now plot the feature importances against the correct feature names
+yield_feature_importances = rf_model.feature_importances_
+
+# Check if the feature importances and feature names match
+assert len(final_feature_names) == len(yield_feature_importances), "Feature names and importances do not match."
+
 # Plot feature importance for yield model
 plt.figure(figsize=(10, 6))
-plt.barh(X.columns, best_yield_model.feature_importances_)
+plt.barh(final_feature_names, yield_feature_importances)
 plt.xlabel('Feature Importance')
 plt.ylabel('Feature')
 plt.title('Feature Importance for Yield Model')
